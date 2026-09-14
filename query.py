@@ -20,8 +20,17 @@ a cent per question for a small document like this.
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
 from langchain_core.prompts import ChatPromptTemplate
+from pinecone import Pinecone
 
-from config import EMBEDDING_MODEL, CHAT_MODEL, PINECONE_INDEX_NAME, RETRIEVAL_K
+from config import (
+    EMBEDDING_MODEL,
+    CHAT_MODEL,
+    PINECONE_API_KEY,
+    PINECONE_INDEX_NAME,
+    INITIAL_RETRIEVAL_K,
+    RERANK_MODEL,
+    RERANK_TOP_N,
+)
 
 # The prompt template is the instruction we send to the LLM alongside the
 # retrieved context. Telling it to answer ONLY from the context (and admit
@@ -48,11 +57,45 @@ def get_vector_store():
     return PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings)
 
 
-def retrieve_chunks(question: str, k: int = RETRIEVAL_K):
+def retrieve_chunks(question: str, k: int = INITIAL_RETRIEVAL_K):
     """Embed the question and return the k most similar chunks stored in
-    Pinecone, ranked by vector similarity (closest meaning first)."""
+    Pinecone, ranked by vector similarity (closest meaning first).
+
+    We now overfetch a larger candidate pool (k=INITIAL_RETRIEVAL_K) than we
+    actually want to send to the LLM, because vector similarity alone is an
+    imperfect relevance signal — rerank_chunks() below narrows this pool
+    down to the truly best matches."""
     vector_store = get_vector_store()
     return vector_store.similarity_search(question, k=k)
+
+
+def rerank_chunks(question: str, chunks, top_n: int = RERANK_TOP_N):
+    """Re-score candidate chunks against the question using Pinecone's
+    hosted reranker, and keep only the top_n most relevant ones.
+
+    Why this helps: similarity_search ranks by embedding distance, which is
+    a decent but imperfect proxy for "actually answers this question." A
+    reranker looks at the question and each chunk's actual text together
+    and scores relevance more precisely — too slow/expensive to run over an
+    entire index, but cheap over the small candidate set we already have.
+
+    Gotcha: the rerank API returns each result's .index (its position in
+    the `documents` list we sent) and .score, NOT the original chunk
+    object. We map that index back into our own `chunks` list so we keep
+    the LangChain Document's metadata (like page number) intact.
+    """
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+
+    texts = [chunk.page_content for chunk in chunks]
+
+    result = pc.inference.rerank(
+        model=RERANK_MODEL,
+        query=question,
+        documents=texts,
+        top_n=top_n,
+    )
+
+    return [chunks[item.index] for item in result.data]
 
 
 def generate_answer(question: str, chunks) -> str:
@@ -70,15 +113,27 @@ def generate_answer(question: str, chunks) -> str:
     return response.content
 
 
-def answer_question(question: str, k: int = RETRIEVAL_K) -> str:
-    """The full Stage 3 + Stage 4 pipeline: retrieve, then generate."""
-    chunks = retrieve_chunks(question, k=k)
+def answer_question(question: str, k: int = INITIAL_RETRIEVAL_K, top_n: int = RERANK_TOP_N) -> str:
+    """The full pipeline: overfetch candidates, rerank down to the best
+    few, then generate an answer from just those."""
+    candidates = retrieve_chunks(question, k=k)
+    chunks = rerank_chunks(question, candidates, top_n=top_n)
     return generate_answer(question, chunks)
 
 
 if __name__ == "__main__":
     question = "What is prompt engineering?"
-    answer = answer_question(question)
 
-    print(f"Question: {question}\n")
+    candidates = retrieve_chunks(question)
+    print(f"Retrieved {len(candidates)} candidates (before rerank):")
+    for i, chunk in enumerate(candidates):
+        print(f"  {i}. page {chunk.metadata.get('page')}: {chunk.page_content[:80]!r}")
+
+    reranked = rerank_chunks(question, candidates)
+    print(f"\nTop {len(reranked)} after reranking:")
+    for chunk in reranked:
+        print(f"  page {chunk.metadata.get('page')}: {chunk.page_content[:80]!r}")
+
+    answer = generate_answer(question, reranked)
+    print(f"\nQuestion: {question}\n")
     print(f"Answer: {answer}")

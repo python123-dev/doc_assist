@@ -86,6 +86,22 @@ def embed_and_store(chunks):
     pc = Pinecone(api_key=PINECONE_API_KEY)
     ensure_index_exists(pc, PINECONE_INDEX_NAME, EMBEDDING_DIMENSION)
 
+    # This app only ever answers questions about ONE document at a time.
+    # from_documents() below always assigns fresh random IDs to each vector,
+    # so without clearing first, every new upload would just add its vectors
+    # on top of whatever's already there — old and new documents' chunks
+    # would mix together (or the same document would end up duplicated if
+    # re-ingested). Wiping the index here keeps it holding exactly one
+    # document's worth of vectors, matching how the app is actually used.
+    #
+    # Guard: deleting from a namespace with zero vectors raises a "not
+    # found" error on Pinecone serverless, so only clear if there's
+    # something there (e.g. skip this on the very first ever ingestion).
+    index = pc.Index(PINECONE_INDEX_NAME)
+    stats = index.describe_index_stats()
+    if stats.get("total_vector_count", 0) > 0:
+        index.delete(delete_all=True)
+
     # OpenAIEmbeddings sends text to OpenAI and gets back a list of numbers
     # (the vector) that represents that text's meaning.
     embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)

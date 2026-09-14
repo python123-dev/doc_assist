@@ -3,6 +3,8 @@ langchain-openai
 langchain-pinecone
 langchain-community
 langchain-text-splitters
+langchain-tavily
+langgraph
 pinecone
 pypdf
 streamlit

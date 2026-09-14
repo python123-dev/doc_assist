@@ -1,0 +1,298 @@
+LEARNINGS — Building the Document Assistant (RAG Project)
+============================================================
+
+THE INITIAL IDEA
+-----------------
+This project started from a simple goal: build a RAG (Retrieval-Augmented
+Generation) "document assistant" — upload a document, ask questions about
+it, get answers grounded in what's actually in that document — and do it
+in a way that was genuinely easy to learn from. The explicit ground rules
+set at the very start were: build it step by step, in small pieces that
+could each be run and understood on their own rather than as one big code
+dump; explain what every piece does and why it's used, not just what it
+does; keep OpenAI API costs as low as possible; and use LangChain, OpenAI,
+and Pinecone as the core stack, since a Pinecone API key was already sitting
+in the project's .env file.
+
+Before writing any code, a few foundational choices were made. Streamlit
+was picked for the frontend over Gradio or a hand-built Flask+HTML app,
+because it's pure Python — no separate HTML/CSS/JS to learn — and gets a
+file uploader and a question box running in a handful of lines. The
+document type was scoped to PDF only at first, to keep the first working
+version simple, with room to add other formats later. And rather than
+reusing an existing Pinecone index, a brand-new one was created from
+scratch as part of the setup, so the whole data flow — from an empty index
+to a working, searchable knowledge base — would be visible from the start.
+
+On the cost side, the cheapest reasonable models were chosen deliberately:
+text-embedding-3-small for turning text into vectors, and gpt-5-nano for
+generating answers. For a small PDF and a handful of questions, this keeps
+the whole pipeline running for a fraction of a cent to a few cents.
+
+
+THE STAGE-BY-STAGE BUILD
+-------------------------
+The core pipeline was built in six deliberately small stages, each one
+runnable and inspectable before moving to the next — the whole point being
+that trust in the system would be built incrementally, not assumed.
+
+Stage 0 was just plumbing: a requirements.txt pinning every package needed,
+a .gitignore (so the very real secret keys sitting in .env could never be
+accidentally committed once this became a git repo), and a config.py that
+loads .env and centralizes every shared setting — model names, chunk size,
+index name — in one place. Running config.py directly confirmed both API
+keys loaded correctly, without ever printing their actual values. This was
+the first checkpoint: prove the plumbing works before spending a cent.
+
+Stage 1 loaded a sample PDF (22-promptengg.pdf) and split it into chunks,
+with zero API calls involved. The reasoning here mattered: an embedding
+model compresses a piece of text into a single vector representing its
+overall meaning, so embedding an entire document as one chunk would produce
+a blurry average of everything in it, and retrieval would never be able to
+find a specific answer. Splitting into small, overlapping chunks — using
+LangChain's RecursiveCharacterTextSplitter — means each vector represents
+one focused idea, and the overlap between chunks prevents an idea from
+being sliced in half at a boundary. Running this stage printed the chunk
+count and a couple of sample chunks, so chunking stopped being an abstract
+idea and became something visible.
+
+Stage 2 turned those chunks into vectors and stored them in Pinecone — the
+first stage that actually spent money, and also the first stage to touch
+Pinecone's index-management API. A new index had to be created with its
+vector dimension set to exactly match the embedding model's output size
+(1536 for text-embedding-3-small); getting that dimension wrong is one of
+the most common beginner mistakes with Pinecone, so it was called out
+explicitly. The index-creation logic was written to check first and only
+create if missing, so re-running ingestion later wouldn't try to create the
+same index twice and crash.
+
+Stage 3 built retrieval: given a question, embed it and ask Pinecone for
+the most similar stored chunks by vector distance. This was deliberately
+kept separate from generating an answer, so retrieval quality could be
+checked on its own — if an answer is ever wrong, being able to see exactly
+which chunks were retrieved immediately tells you whether the problem is
+bad retrieval or a bad LLM read of good context, which are very different
+bugs to fix.
+
+Stage 4 added generation: the retrieved chunks and the question get joined
+into a prompt and handed to the chat model. Rather than reaching for
+LangChain's built-in create_retrieval_chain helper, retrieval and
+generation were kept as two separate, visible function calls throughout the
+whole project — a deliberate choice to keep every moving part inspectable
+rather than hidden inside a framework abstraction. The prompt template
+explicitly instructs the model to answer only from the given context and
+to say "I don't know" rather than invent an answer, which is the main
+defense a RAG app has against hallucination.
+
+Stage 5 wrapped all of this in a Streamlit app: a file uploader that runs
+the chunk-embed-store pipeline, and a question box that runs the
+retrieve-generate pipeline, with the results displayed on the page.
+Streamlit's session_state was used to remember which file had already been
+processed, so asking a second question wouldn't trigger a second, wasted
+round of embedding the same document.
+
+
+ADDING A RERANKER
+-------------------
+Once the core pipeline worked end to end, the next improvement was a
+reranker. The problem it solves: vector similarity search is a decent but
+imperfect signal for "this chunk actually answers the question" — it's
+common for a title slide or an agenda page to rank close to a real answer
+just because they share vocabulary. A reranker looks at the question and
+each candidate chunk's actual text together and scores relevance far more
+precisely, at a cost too high to run over an entire index but cheap over a
+small candidate set.
+
+Three reranking options were weighed: Pinecone's own hosted reranker,
+Cohere's Rerank API, or a local cross-encoder model running on the machine
+itself. Pinecone-hosted reranking won specifically because it reused the
+Pinecone account and API key already in place — no new signup, no new
+service to manage, in keeping with the project's cost- and
+simplicity-conscious spirit throughout. The implementation overfetches a
+larger pool of candidates by vector similarity (15 instead of the original
+4), sends their text to Pinecone's bge-reranker-v2-m3 model along with the
+question, and keeps only the top few results — mapping the reranker's
+returned indices back to the original chunk objects, since the rerank API
+hands back scores and positions rather than the original data. This was
+verified by literally printing the chunk order before and after reranking
+for a test question, and watching the correct definition chunk jump from
+buried in the middle to first place.
+
+
+ADDING AN AGENT
+------------------
+The next addition was explicitly required to be a "real" agent — the
+user was clear that a hardcoded if/else pretending to make a decision
+would not count. Three genuinely different agent ideas were presented:
+a web-search fallback agent, a multi-step research agent that breaks a
+complex question into sub-questions, and a self-correcting agent that
+grades and retries its own answers. The web-search fallback agent was
+chosen because it adds a real new capability — answering questions the
+uploaded document simply doesn't contain — and because a Tavily web-search
+API key was already sitting unused in .env, meaning no new account was
+needed there either.
+
+What makes this a genuine agent, rather than a disguised branch, is that
+the routing decision is made entirely by the LLM itself. Two tools were
+defined: search_document (a thin wrapper around the existing retrieve-and-
+rerank logic, returning raw relevant text rather than a fully generated
+answer, to avoid paying for two rounds of generation) and search_web
+(Tavily's search tool). LangChain's create_agent function wires a model,
+these tools, and a system prompt into a ready-to-run reasoning loop: the
+LLM reads each tool's description, decides whether and which to call,
+inspects the results, and keeps going until it produces a final answer
+that states which source it came from. A slightly stronger model
+(gpt-5-mini) was used for the agent specifically, on the reasoning that
+deciding whether and which tool to call is a harder judgment call than
+simply answering from context already handed to you — while the plain RAG
+path kept its original, cheaper model untouched.
+
+This was verified twice: first from the terminal, asking one question
+answerable from the PDF (which correctly routed to search_document only)
+and one clearly outside it — "who won the most recent Ballon d'Or" —
+which correctly tried the document first, found nothing useful, and fell
+back to a live web search. It was then verified again live in the
+Streamlit app itself, via a new "Allow web search (agent mode)" checkbox
+that lets the two pipelines be compared side by side without disturbing
+the simpler path that was already understood and trusted.
+
+
+THE DUPLICATE-VECTOR PROBLEM
+-------------------------------
+While testing the reranker's overfetch behavior, every retrieved chunk was
+showing up twice. The root cause: LangChain's PineconeVectorStore.
+from_documents assigns a random ID to every vector when none is given, so
+every single call to the storage function — whether from re-running the
+ingestion script or re-uploading a PDF in the Streamlit app — added new
+vectors without ever replacing old ones. Repeated testing during
+development had quietly built up duplicate copies of the same document's
+chunks inside the index.
+
+Three fixes were considered: clearing the index before every new
+ingestion, giving each chunk a deterministic ID derived from its content
+so re-ingesting the same file overwrites itself instead of duplicating,
+or giving each uploaded document its own Pinecone namespace so multiple
+documents could coexist cleanly. Clearing the index before each ingestion
+was chosen, because it most directly matches how the app is actually used
+— one document at a time, with a fresh upload meant to fully replace
+whatever was there before rather than merge with it. The implementation
+needed one extra safeguard: Pinecone's serverless index throws a "not
+found" error if you try to clear a namespace that's currently empty (for
+instance, right after a brand-new index is created), so the clearing step
+first checks the index's vector count and only issues the delete if
+there's actually something to remove. This was verified by running
+ingestion twice in a row on the same document and confirming, both times,
+that every chunk appeared exactly once in retrieval — not twice.
+
+
+TOOLS AND RESOURCES USED, AND WHY
+------------------------------------
+LangChain was the glue framework throughout — document loading, text
+splitting, prompt templates, and the agent-building create_agent function
+all came from it, chosen because it has ready-made, well-tested pieces for
+exactly this kind of pipeline rather than needing everything hand-rolled.
+
+OpenAI supplied both the embedding model (text-embedding-3-small) and the
+chat models (gpt-5-nano for plain answering, gpt-5-mini for the agent's
+tool-routing decisions) — picked in each case for being the cheapest model
+capable of doing that specific job well.
+
+Pinecone served two roles: as the vector database storing and searching
+document embeddings, and later as the source of a hosted reranking model —
+both reusing the single Pinecone API key already available, avoiding a
+second vendor relationship for what is conceptually a related job.
+
+Tavily provided live web search for the agent's fallback tool, again
+reusing a key that was already present but unused in the project's .env
+file.
+
+Streamlit was the frontend framework, chosen at the very start over Gradio
+or a hand-built web app specifically because it required no separate
+HTML/CSS/JavaScript layer — a file uploader and a text input were each a
+single line of Python.
+
+Throughout the project, research into "what is the exact current API for
+X" (LangChain's current package layout, Pinecone's rerank endpoint,
+create_agent's usage, Tavily's LangChain integration) was done deliberately
+before writing code, rather than relying purely on prior knowledge — since
+these libraries evolve quickly and using a stale API shape was a real risk
+worth checking against first.
+
+
+PROBLEMS FACED, AND HOW THEY WERE RESOLVED
+---------------------------------------------
+A handful of smaller snags came up along the way, beyond the reranker and
+agent design questions and the duplicate-vector bug already described.
+LangChain's community package (langchain-community, home of PyPDFLoader)
+surfaced a deprecation warning noting it's being sunset in favor of
+standalone integration packages — noted and left alone, since it still
+works correctly and current documentation still points to it. During
+browser-based UI testing, the Chrome automation extension wasn't connected
+on the first attempt, which simply meant asking the user to test the
+upload flow manually instead of forcing an automated check. Later, once
+the extension was connected, the screenshot tool intermittently timed out
+against the running Streamlit page — worked around by reading the page's
+accessibility tree and inspecting DOM state directly via JavaScript instead
+of relying on visual screenshots, which turned out to be a reliable way to
+confirm both the "document-only" and "agent mode" answer paths actually
+worked in the live app.
+
+
+HOW THE FOLDER AND FILES FIT TOGETHER
+------------------------------------------
+The project deliberately stayed flat — no subfolders of source code, no
+classes where a plain function would do — so that the relationship between
+files could stay easy to hold in your head.
+
+config.py sits at the bottom of the dependency chain: it imports nothing
+project-specific, just reads .env and defines every shared constant (model
+names, chunk size, index name, retrieval and rerank settings). Every other
+Python file imports from config.py rather than hardcoding these values
+itself, so tuning cost or quality later only ever means changing one file.
+
+ingest.py imports from config.py and owns the "getting a document into
+Pinecone" side of the project: load_and_split (PDF to chunks),
+ensure_index_exists (create the Pinecone index if needed), and
+embed_and_store (embed chunks and upload them, clearing old vectors first).
+
+query.py also imports from config.py, independently of ingest.py, and owns
+the "answering a question" side: retrieve_chunks (vector similarity
+search), rerank_chunks (Pinecone hosted reranking), generate_answer
+(prompt plus chat model), and answer_question, which strings the first
+three together into the full plain-RAG pipeline.
+
+agent.py imports from config.py directly, and also imports retrieve_chunks
+and rerank_chunks from query.py rather than duplicating that logic — it
+wraps them into a search_document tool, adds a search_web tool backed by
+Tavily, and exposes run_agent as the entry point for the tool-using
+pipeline.
+
+app.py sits on top of all three: it imports load_and_split and
+embed_and_store from ingest.py, answer_question from query.py, and
+run_agent from agent.py, and contains no retrieval, embedding, or
+generation logic of its own — it is purely Streamlit UI code that calls
+into the already-tested functions underneath and displays their results.
+
+Alongside the Python files: .env holds the real, live secret API keys and
+must never be committed or shared; .gitignore keeps .env (and .venv,
+__pycache__, etc.) out of version control; requirements.txt pins every
+package the project depends on; and README.md is the technical reference
+document — architecture diagram, setup steps, running instructions, and
+the cost/quality tuning knobs — written for someone who wants to operate
+the project, as a companion to this file, which is written for someone who
+wants to understand how it came to be.
+
+
+WHAT'S STILL OPEN
+--------------------
+Two ideas were raised but not yet built by the end of this project's
+current work: supporting multi-turn conversation (remembering earlier
+questions and answers rather than treating every question in isolation),
+and supporting document types beyond PDF, such as .txt or .docx files.
+Both would extend the existing structure rather than requiring a rebuild —
+multi-turn conversation would mainly touch query.py and app.py, and
+additional file types would mainly touch ingest.py's loading step. And as
+a standing reminder: the .env file in this project contains real,
+functioning API keys in plain text, and should never be pasted anywhere,
+committed to version control, or shared — the .gitignore file protects
+against the first of those, but not the other two.

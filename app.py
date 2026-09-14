@@ -19,6 +19,7 @@ import streamlit as st
 
 from ingest import load_and_split, embed_and_store
 from query import answer_question
+from agent import run_agent
 
 st.title("Document Assistant")
 st.caption("Upload a PDF, then ask questions about it.")
@@ -51,11 +52,16 @@ elif uploaded_file is not None:
     st.info(f"'{uploaded_file.name}' is already indexed.")
 
 question = st.text_input("Ask a question about the document")
+use_agent = st.checkbox(
+    "Allow web search (agent mode)",
+    help="Off: answers only from your document. On: an agent decides whether "
+         "to use the document or fall back to a live web search.",
+)
 
 if question:
     if st.session_state.ingested_file is None:
         st.warning("Upload a document first.")
     else:
         with st.spinner("Thinking..."):
-            answer = answer_question(question)
+            answer = run_agent(question) if use_agent else answer_question(question)
         st.write(answer)
